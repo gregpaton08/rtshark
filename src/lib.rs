@@ -54,6 +54,8 @@ pub struct Metadata {
     /// It uses pyshark-like algorithm to display the best 'value' :
     /// it looks for "show" first, then "value", finally "showname"
     value: String,
+    /// Value read by TShark, in hex format
+    raw_value: String,
     /// Both name and value, as displayed by thshark
     display: String,
     /// Size of this data extracted from packet header protocol, in bytes
@@ -65,10 +67,11 @@ pub struct Metadata {
 /// This is one metadata from a given layer of the packet returned by TShark application.
 impl Metadata {
     /// Creates a new metadata. This function is useless for most applications.
-    pub fn new(name: String, value: String, display: String, size: u32, position: u32) -> Metadata {
+    pub fn new(name: String, value: String, raw_value:String, display: String, size: u32, position: u32) -> Metadata {
         Metadata {
             name,
             value,
+            raw_value,
             display,
             size,
             position,
@@ -99,6 +102,18 @@ impl Metadata {
     /// ```
     pub fn value(&self) -> &str {
         self.value.as_str()
+    }
+
+    /// Value read by TShark, in hex format
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let ip_src = rtshark::Metadata::new("ip.src".to_string(), "127.0.0.1".to_string(), "3132372e302e302e31".to_string(), "Source: 127.0.0.1".to_string(), 4, 12);
+    /// assert_eq!(ip_src.raw_value(), "3132372e302e302e31")
+    /// ```
+    pub fn raw_value(&self) -> &str {
+        self.raw_value.as_str()
     }
 
     /// Both name and value, as displayed by TShark
@@ -147,6 +162,10 @@ pub struct Layer {
     index: usize,
     /// List of metadata associated to this layer
     metadata: Vec<Metadata>,
+    /// The size of the layer in bytes.
+    size: usize,
+    /// Offset of this data in the packet, in bytes
+    position: u32,
 }
 
 impl Layer {
@@ -155,13 +174,15 @@ impl Layer {
     /// # Example
     ///
     /// ```
-    /// let ip_layer = rtshark::Layer::new("ip".to_string(), 1);
+    /// let ip_layer = rtshark::Layer::new("ip".to_string(), 1, 20);
     /// ```
-    pub fn new(name: String, index: usize) -> Self {
+    pub fn new(name: String, index: usize, size: usize, position: u32) -> Self {
         Layer {
             name,
             index,
             metadata: vec![],
+            size,
+            position,
         }
     }
     /// Retrieves the layer name of this layer object. This name is a protocol name returned by TShark.
@@ -186,6 +207,30 @@ impl Layer {
     /// ```
     pub fn index(&self) -> usize {
         self.index
+    }
+
+    /// Retrieves the layer's size in bytes.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let mut ip_layer = rtshark::Layer::new("ip".to_string(), 1, 36);
+    /// assert_eq!(ip_layer.size(), 36)
+    /// ```
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Offset of this layer in the packet, in bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut ip_layer = rtshark::Layer::new("ip".to_string(), 1, 36, 14);
+    /// assert_eq!(ip_layer.position(), 14)
+    /// ```
+    pub fn position(&self) -> u32 {
+        self.position
     }
 
     /// Adds a metadata in the list of metadata for this layer. This function is useless for most applications.
@@ -274,6 +319,8 @@ pub struct Packet {
     /// Packet capture timestamp --- the number of non-leap-microseconds since
     /// January 1, 1970 UTC
     timestamp_micros: Option<i64>,
+    /// The size of the layer.
+    pub size: usize,
 }
 
 impl Packet {
@@ -300,13 +347,13 @@ impl Packet {
     /// let mut ip_packet = rtshark::Packet::new();
     /// ip_packet.push("ip".to_string());
     /// ```
-    pub fn push(&mut self, name: String) {
-        let layer = Layer::new(name, self.layers.len());
+    pub fn push(&mut self, name: String, size: usize, position: u32) {
+        let layer = Layer::new(name, self.layers.len(), size, position);
         self.layers.push(layer);
     }
 
     /// Push a new layer at the end of the layer stack if the given layer does not exist yet.
-    pub fn push_if_not_exist(&mut self, name: String) {
+    pub fn push_if_not_exist(&mut self, name: String, size: usize, position: u32) {
         if let Some(last_layer) = self.last_layer_mut() {
             // ignore the layer if it already exists
             if last_layer.name.eq(&name) {
@@ -314,7 +361,7 @@ impl Packet {
             }
         }
 
-        self.push(name);
+        self.push(name, size, position);
     }
 
     /// Get the last layer as mutable reference. It is used to push incoming metadata in the current packet.
@@ -763,8 +810,16 @@ impl<'a> RTSharkBuilderReady<'a> {
             }
         }
 
+        // TODO: Greg added this
+        //       Just use method metadata_whitelist // NOTE: this has bugs for "_ws.col.info"
+        // tshark_params.extend(&["-e", "_ws.col.info"]);
+        // Not compatible with PDML, will silently fail.
+        // tshark_params.extend(&["-x"]); // add output of hex and ASCII dump (Packet Bytes)
+
         // piping from TShark, not to load the entire JSON in ram...
         // this may fail if TShark is not found in path
+
+        println!("{:?}", tshark_params.join(" "));
 
         let tshark_child = if self.env_path.is_empty() {
             Command::new("tshark")
@@ -964,6 +1019,10 @@ impl RTShark {
         self.process.as_ref().map(|p| p.id())
     }
 
+    pub fn position(&self) -> usize {
+        self.parser.buffer_position()
+    }
+
     /// Check if process is stopped, get the exit code and return true if stopped.
     fn try_wait_has_exited(child: &mut Child) -> bool {
         #[cfg(target_family = "unix")]
@@ -1064,9 +1123,16 @@ fn rtshark_build_metadata(tag: &BytesStart, filters: &[String]) -> Result<Option
         Err(err) => Err(err),
     }?;
 
+    // let raw_value = match rtshark_attr_by_name(tag, b"value") {
+    //     Ok(value) => Ok(value),
+    //     Err(err) => Err(err),
+    // }?;
+    let raw_value = rtshark_attr_by_name(tag, b"value").unwrap_or_default();
+
     let mut metadata = Metadata {
         name,
         value,
+        raw_value,
         display: String::new(),
         size: 0,
         position: 0,
@@ -1150,10 +1216,10 @@ fn parse_xml<B: BufRead>(
     // ...
 
     /// Create a new layer if required and add metadata to the given packet.
-    fn _add_metadata(packet: &mut Packet, metadata: Metadata) -> Result<()> {
+    fn _add_metadata(packet: &mut Packet, metadata: Metadata, size: usize, position: u32) -> Result<()> {
         // Create a new layer if the field's protocol does not exist yet as a layer.
         if let Some(proto) = metadata.name().split('.').next() {
-            packet.push_if_not_exist(proto.to_owned());
+            packet.push_if_not_exist(proto.to_owned(), size, position);
         }
 
         if let Some(layer) = packet.last_layer_mut() {
@@ -1168,6 +1234,20 @@ fn parse_xml<B: BufRead>(
         Ok(())
     }
 
+    fn _get_size(e: &BytesStart) -> usize {
+        match rtshark_attr_by_name(e, b"size"){
+            Ok(size) => size.parse().unwrap(),
+            Err(_) => 0,
+        }
+    }
+
+    fn _get_position(e: &BytesStart) -> u32 {
+        match rtshark_attr_by_name(e, b"pos"){
+            Ok(size) => size.parse().unwrap(),
+            Err(_) => 0,
+        }
+    }
+
     loop {
         match xml_reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
@@ -1176,21 +1256,29 @@ fn parse_xml<B: BufRead>(
                     let proto = rtshark_attr_by_name(e, b"name")?;
                     protoname = Some(proto.to_owned());
 
+                    // let size: usize = match rtshark_attr_by_name(e, b"size"){
+                    //     Ok(size) => size.parse().unwrap(),
+                    //     Err(_) => 0,
+                    // };
+
+                    // // packet.size = size;
+
                     // If we face a new protocol, add it in the packet layers stack.
                     if !ignored_protocols(proto.as_str()) {
-                        packet.push(proto);
+                        packet.push(proto, _get_size(e), _get_position(e));
                     }
                 }
 
                 // There are cases where fields are mapped in fields. So check if there is any parent field and extract its metadata.
                 if b"field" == e.name().as_ref() {
                     if let Some(metadata) = rtshark_build_metadata(e, filters)? {
-                        _add_metadata(&mut packet, metadata)?;
+                        _add_metadata(&mut packet, metadata, _get_size(e), _get_position(e))?;
                     }
                 }
             }
             Ok(Event::Empty(ref e)) => {
                 // Here we should not have anything else than "field" but do a test anyway.
+                // debug_assert_eq!(b"field", e.name().as_ref(), "{:?}", e);
                 if b"field" == e.name().as_ref() {
                     // Here we have two cases : with or without encapsuling "proto"
                     // We have a protocol if "whitelist" mode is disabled.
@@ -1204,7 +1292,7 @@ fn parse_xml<B: BufRead>(
                             packet.last_layer_mut().unwrap().add(metadata);
                         }
                     } else if let Some(metadata) = rtshark_build_metadata(e, filters)? {
-                        _add_metadata(&mut packet, metadata)?;
+                        _add_metadata(&mut packet, metadata, _get_size(e), _get_position(e))?;
                     }
                 }
             }
