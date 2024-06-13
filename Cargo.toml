@@ -23,6 +23,7 @@ quick-xml = "0.30"
 tempdir = "0.3"
 libc = "0.2"
 serial_test="2"
+sysinfo = "0.30.12"
 
 [target.'cfg(unix)'.dev-dependencies]
 nix = "0.25"

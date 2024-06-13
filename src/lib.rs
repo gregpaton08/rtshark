@@ -62,12 +62,22 @@ pub struct Metadata {
     size: u32,
     /// Offset of this data in the packet, in bytes
     position: u32,
+    /// true if the hide attribute is set to yes, otherwise false.
+    hide: bool,
 }
 
 /// This is one metadata from a given layer of the packet returned by TShark application.
 impl Metadata {
     /// Creates a new metadata. This function is useless for most applications.
-    pub fn new(name: String, value: String, raw_value:String, display: String, size: u32, position: u32) -> Metadata {
+    pub fn new(
+        name: String,
+        value: String,
+        raw_value: String,
+        display: String,
+        size: u32,
+        position: u32,
+        hide: bool,
+    ) -> Metadata {
         Metadata {
             name,
             value,
@@ -75,6 +85,7 @@ impl Metadata {
             display,
             size,
             position,
+            hide,
         }
     }
 
@@ -150,6 +161,10 @@ impl Metadata {
     /// ```
     pub fn position(&self) -> u32 {
         self.position
+    }
+
+    pub fn hide(&self) -> bool {
+        self.hide
     }
 }
 
@@ -1026,10 +1041,10 @@ impl RTShark {
     /// Check if process is stopped, get the exit code and return true if stopped.
     fn try_wait_has_exited(child: &mut Child) -> bool {
         #[cfg(target_family = "unix")]
-            let value =
+        let value =
             matches!(child.try_wait(), Ok(Some(s)) if s.code().is_some() || s.signal().is_some());
         #[cfg(target_family = "windows")]
-            let value = matches!(child.try_wait(), Ok(Some(s)) if s.code().is_some() );
+        let value = matches!(child.try_wait(), Ok(Some(s)) if s.code().is_some() );
         value
     }
 }
@@ -1128,6 +1143,13 @@ fn rtshark_build_metadata(tag: &BytesStart, filters: &[String]) -> Result<Option
     //     Err(err) => Err(err),
     // }?;
     let raw_value = rtshark_attr_by_name(tag, b"value").unwrap_or_default();
+    let hide = match rtshark_attr_by_name(tag, b"hide")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "yes" => true,
+        _ => false,
+    };
 
     let mut metadata = Metadata {
         name,
@@ -1136,6 +1158,7 @@ fn rtshark_build_metadata(tag: &BytesStart, filters: &[String]) -> Result<Option
         display: String::new(),
         size: 0,
         position: 0,
+        hide,
     };
 
     if let Ok(position) = rtshark_attr_by_name_u32(tag, b"pos") {
@@ -1193,6 +1216,7 @@ fn parse_xml<B: BufRead>(
     let mut packet = Packet::new();
 
     let mut protoname = None;
+    // let mut protonames: Vec<String> = Vec::new();
 
     // tshark pdml is something like : (default mode)
     //
@@ -1216,7 +1240,12 @@ fn parse_xml<B: BufRead>(
     // ...
 
     /// Create a new layer if required and add metadata to the given packet.
-    fn _add_metadata(packet: &mut Packet, metadata: Metadata, size: usize, position: u32) -> Result<()> {
+    fn _add_metadata(
+        packet: &mut Packet,
+        metadata: Metadata,
+        size: usize,
+        position: u32,
+    ) -> Result<()> {
         // Create a new layer if the field's protocol does not exist yet as a layer.
         if let Some(proto) = metadata.name().split('.').next() {
             packet.push_if_not_exist(proto.to_owned(), size, position);
@@ -1235,14 +1264,14 @@ fn parse_xml<B: BufRead>(
     }
 
     fn _get_size(e: &BytesStart) -> usize {
-        match rtshark_attr_by_name(e, b"size"){
+        match rtshark_attr_by_name(e, b"size") {
             Ok(size) => size.parse().unwrap(),
             Err(_) => 0,
         }
     }
 
     fn _get_position(e: &BytesStart) -> u32 {
-        match rtshark_attr_by_name(e, b"pos"){
+        match rtshark_attr_by_name(e, b"pos") {
             Ok(size) => size.parse().unwrap(),
             Err(_) => 0,
         }
@@ -1252,9 +1281,21 @@ fn parse_xml<B: BufRead>(
         match xml_reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 // Here we have "packet" and "proto" and sometimes "field" tokens. Only "proto" and "field" are interesting today.
+                // TODO: BUG! proto can be nested. Not sure how to handle this.
+                /*if b"proto" == e.name().as_ref() && !protonames.is_empty() {
+                    println!(
+                        "Nested proto {:?} found in {:?}",
+                        rtshark_attr_by_name(e, b"name"),
+                        protonames.last()
+                    );
+                    let proto = rtshark_attr_by_name(e, b"name")?;
+                    protonames.push(proto.to_owned());
+                } else */
                 if b"proto" == e.name().as_ref() {
                     let proto = rtshark_attr_by_name(e, b"name")?;
                     protoname = Some(proto.to_owned());
+                    // println!("new proto started {:?}", proto);
+                    // protonames.push(proto.to_owned());
 
                     // let size: usize = match rtshark_attr_by_name(e, b"size"){
                     //     Ok(size) => size.parse().unwrap(),
@@ -1268,21 +1309,31 @@ fn parse_xml<B: BufRead>(
                         packet.push(proto, _get_size(e), _get_position(e));
                     }
                 }
-
                 // There are cases where fields are mapped in fields. So check if there is any parent field and extract its metadata.
-                if b"field" == e.name().as_ref() {
+                else if b"field" == e.name().as_ref() {
+                    // println!("new field {:?} started for proto {:?}", e, protonames.last());
                     if let Some(metadata) = rtshark_build_metadata(e, filters)? {
+                        // println!("new metadata {:?}", metadata.name);
                         _add_metadata(&mut packet, metadata, _get_size(e), _get_position(e))?;
                     }
                 }
             }
             Ok(Event::Empty(ref e)) => {
+                // Handle the case of empty, i.e. self-closing, tags. For example:
+                //      <field name="field.name" ... />
                 // Here we should not have anything else than "field" but do a test anyway.
                 // debug_assert_eq!(b"field", e.name().as_ref(), "{:?}", e);
                 if b"field" == e.name().as_ref() {
+                    // let last_layer_name = if packet.last_layer_mut().is_some() {
+                    //     packet.last_layer_mut().unwrap().name().to_owned()
+                    // } else {
+                    //     String::new()
+                    // };
+                    // println!("{:?}    last layer =  {:?}", e, last_layer_name);
                     // Here we have two cases : with or without encapsuling "proto"
                     // We have a protocol if "whitelist" mode is disabled.
                     // Protocol "geninfo" is always here.
+                    // if let Some(name) = protonames.last().as_ref() {
                     if let Some(name) = protoname.as_ref() {
                         if ignored_protocols(name) {
                             // Put geninfo metadata in packet's object (timestamp ...).
@@ -1298,7 +1349,15 @@ fn parse_xml<B: BufRead>(
             }
             Ok(Event::End(ref e)) => match e.name().as_ref() {
                 b"packet" => return Ok(Some(packet)),
-                b"proto" => protoname = None,
+                b"proto" => {
+                    // println!("{:?}", e.name());
+                    // let proto = rtshark_attr_by_name(e, b"name")?;
+                    // if proto != protoname.unwrap_or("".into()) {
+                    //     println!("END proto end {:?} does not equal existing proto {:?}", proto, protoname);
+                    // }
+                    // protonames.pop();
+                    protoname = None
+                }
                 _ => (),
             },
 
@@ -1797,6 +1856,171 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_xml_proto_in_proto() {
+        let xml = r#"
+        <pdml>
+         <packet>
+        <proto name="icmp" showname="Internet Control Message Protocol" size="36" pos="34">
+            <field name="icmp.type" showname="Type: 3 (Destination unreachable)" size="1" pos="34" show="3" value="03"/>
+            <field name="icmp.code" showname="Code: 3 (Port unreachable)" size="1" pos="35" show="3" value="03"/>
+            <field name="icmp.checksum" showname="Checksum: 0xfe7b [correct]" size="2" pos="36" show="0xfe7b" value="fe7b"/>
+            <field name="icmp.checksum.status" showname="Checksum Status: Good" size="0" pos="36" show="1"/>
+            <field name="icmp.unused" showname="Unused: 00000000" size="4" pos="38" show="00:00:00:00" value="00000000"/>
+            <proto name="ip" showname="Internet Protocol Version 4, Src: xxx.xxx.xxx.xxx, Dst: 192.168.2.44" size="20" pos="42">
+                <field name="ip.version" showname="0100 .... = Version: 4" size="1" pos="42" show="4" value="45"/>
+                <field name="ip.hdr_len" showname=".... 0101 = Header Length: 20 bytes (5)" size="1" pos="42" show="20" value="45"/>
+                <field name="ip.dsfield" showname="Differentiated Services Field: 0x00 (DSCP: CS0, ECN: Not-ECT)" size="1" pos="43" show="0x00" value="00">
+                    <field name="ip.dsfield.dscp" showname="0000 00.. = Differentiated Services Codepoint: Default (0)" size="1" pos="43" show="0" value="0" unmaskedvalue="00"/>
+                    <field name="ip.dsfield.ecn" showname=".... ..00 = Explicit Congestion Notification: Not ECN-Capable Transport (0)" size="1" pos="43" show="0" value="0" unmaskedvalue="00"/>
+                </field>
+                <field name="ip.len" showname="Total Length: 59" size="2" pos="44" show="59" value="003b"/>
+                <field name="ip.id" showname="Identification: 0x0000 (0)" size="2" pos="46" show="0x0000" value="0000"/>
+                <field name="ip.flags" showname="010. .... = Flags: 0x2, Don&#x27;t fragment" size="1" pos="48" show="0x02" value="2" unmaskedvalue="40">
+                    <field name="ip.flags.rb" showname="0... .... = Reserved bit: Not set" size="1" pos="48" show="False" value="0" unmaskedvalue="40"/>
+                    <field name="ip.flags.df" showname=".1.. .... = Don&#x27;t fragment: Set" size="1" pos="48" show="True" value="1" unmaskedvalue="40"/>
+                    <field name="ip.flags.mf" showname="..0. .... = More fragments: Not set" size="1" pos="48" show="False" value="0" unmaskedvalue="40"/>
+                </field>
+                <field name="ip.frag_offset" showname="...0 0000 0000 0000 = Fragment Offset: 0" size="2" pos="48" show="0" value="0" unmaskedvalue="4000"/>
+                <field name="ip.ttl" showname="Time to Live: 58" size="1" pos="50" show="58" value="3a"/>
+                <field name="ip.proto" showname="Protocol: UDP (17)" size="1" pos="51" show="17" value="11"/>
+                <field name="ip.checksum" showname="Header Checksum: 0xcb34 [validation disabled]" size="2" pos="52" show="0xcb34" value="cb34"/>
+                <field name="ip.checksum.status" showname="Header checksum status: Unverified" size="0" pos="52" show="2"/>
+                <field name="ip.src" showname="Source Address: xxx.xxx.xxx.xxx" size="4" pos="54" show="xxx.xxx.xxx.xxx" value="8efb23ae"/>
+                <field name="ip.addr" showname="Source or Destination Address: xxx.xxx.xxx.xxx" hide="yes" size="4" pos="54" show="xxx.xxx.xxx.xxx" value="8efb23ae"/>
+                <field name="ip.src_host" showname="Source Host: xxx.xxx.xxx.xxx" hide="yes" size="4" pos="54" show="xxx.xxx.xxx.xxx" value="8efb23ae"/>
+                <field name="ip.host" showname="Source or Destination Host: xxx.xxx.xxx.xxx" hide="yes" size="4" pos="54" show="xxx.xxx.xxx.xxx" value="8efb23ae"/>
+                <field name="ip.dst" showname="Destination Address: 192.168.2.44" size="4" pos="58" show="192.168.2.44" value="c0a8022c"/>
+                <field name="ip.addr" showname="Source or Destination Address: 192.168.2.44" hide="yes" size="4" pos="58" show="192.168.2.44" value="c0a8022c"/>
+                <field name="ip.dst_host" showname="Destination Host: 192.168.2.44" hide="yes" size="4" pos="58" show="192.168.2.44" value="c0a8022c"/>
+                <field name="ip.host" showname="Source or Destination Host: 192.168.2.44" hide="yes" size="4" pos="58" show="192.168.2.44" value="c0a8022c"/>
+            </proto>
+            <proto name="udp" showname="User Datagram Protocol, Src Port: 443, Dst Port: 64670" size="8" pos="62">
+                <field name="udp.srcport" showname="Source Port: 443" size="2" pos="62" show="443" value="01bb"/>
+                <field name="udp.dstport" showname="Destination Port: 64670" size="2" pos="64" show="64670" value="fc9e"/>
+                <field name="udp.port" showname="Source or Destination Port: 443" hide="yes" size="2" pos="62" show="443" value="01bb"/>
+                <field name="udp.port" showname="Source or Destination Port: 64670" hide="yes" size="2" pos="64" show="64670" value="fc9e"/>
+                <field name="udp.length" showname="Length: 39" size="2" pos="66" show="39" value="0027"/>
+                <field name="udp.checksum" showname="Checksum: 0x0000 [zero-value ignored]" size="2" pos="68" show="0x0000" value="0000">
+                    <field name="udp.checksum.status" showname="Checksum Status: Not present" size="2" pos="68" show="3" value="0000"/>
+                </field>
+                <field name="udp.stream" showname="Stream index: 11" size="0" pos="70" show="11"/>
+            </proto>
+        </proto>
+         </packet>
+        </pdml>"#;
+
+        let mut reader = quick_xml::Reader::from_reader(BufReader::new(xml.as_bytes()));
+        match parse_xml(&mut reader, &[]).unwrap() {
+            Some(p) => match p.layer_name("icmp") {
+                Some(layer) => {
+                    let metadata_name = "icmp.type";
+                    layer
+                        .metadata(metadata_name)
+                        .unwrap_or_else(|| panic!("Missing {}", metadata_name));
+
+                    let metadata_name = "ip.version";
+                    layer
+                        .metadata(metadata_name)
+                        .unwrap_or_else(|| panic!("Missing {}", metadata_name));
+                }
+                None => panic!("missing protocol"),
+            },
+            _ => panic!("invalid Output type"),
+        }
+
+        let xml = r#"
+        <pdml>
+         <packet>
+        <proto name="quic" showname="QUIC IETF" size="1250" pos="42">
+    <field name="" show="QUIC Connection information" size="0" pos="42">
+      <field name="quic.connection.number" showname="Connection Number: 10" size="0" pos="42" show="10"/>
+    </field>
+    <field name="quic.packet_length" showname="Packet Length: 1250" size="0" pos="42" show="1250"/>
+    <field name="quic.header_form" showname="1... .... = Header Form: Long Header (1)" size="1" pos="42" show="1" value="1" unmaskedvalue="c9"/>
+    <field name="quic.fixed_bit" showname=".1.. .... = Fixed Bit: True" size="1" pos="42" show="True" value="1" unmaskedvalue="c9"/>
+    <field name="quic.long.packet_type" showname="..00 .... = Packet Type: Initial (0)" size="1" pos="42" show="0" value="0" unmaskedvalue="c9"/>
+    <field name="quic.long.reserved" showname=".... 00.. = Reserved: 0" size="1" pos="42" show="0" value="0" unmaskedvalue="c9"/>
+    <field name="quic.packet_number_length" showname=".... ..00 = Packet Number Length: 1 bytes (0)" size="1" pos="42" show="0" value="0" unmaskedvalue="c9"/>
+    <field name="quic.version" showname="Version: 1 (0x00000001)" size="4" pos="43" show="0x00000001" value="00000001"/>
+    <field name="quic.dcil" showname="Destination Connection ID Length: 0" size="1" pos="47" show="0" value="00"/>
+    <field name="quic.scil" showname="Source Connection ID Length: 8" size="1" pos="48" show="8" value="08"/>
+    <field name="quic.scid" showname="Source Connection ID: f15dc23d0d5fb6c2" size="8" pos="49" show="f1:5d:c2:3d:0d:5f:b6:c2" value="f15dc23d0d5fb6c2"/>
+    <field name="quic.token_length" showname="Token Length: 0" size="1" pos="57" show="0" value="00"/>
+    <field name="quic.length" showname="Length: 1232" size="2" pos="58" show="1232" value="44d0"/>
+    <field name="quic.packet_number" showname="Packet Number: 1" size="1" pos="60" show="1" value="91"/>
+    <field name="quic.payload" showname="Payload [truncated]: 497afa0c28063859143976f2c610146c21ad0c87b08b8385d69b1ad1dd4e6f71163aafdb3e59f8419f73ffd3013cbe25cc57b48db2502253adb6afbb6af97fef683519ebce14843948f5d8a92a4fdd8e33144b5247ba94db90e380d68219bfdb73d979d2827486eec1d48b5662" size="1231" pos="61" show="49:7a:fa:0c:28:06:38:59:14:39:76:f2:c6:10:14:6c:21:ad:0c:87:b0:8b:83:85:d6:9b:1a:d1:dd:4e:6f:71:16:3a:af:db:3e:59:f8:41:9f:73:ff:d3:01:3c:be:25:cc:57:b4:8d:b2:50:22:53:ad:b6:af:bb:6a:f9:7f:ef:68:35:19:eb:ce:14:84:39:48:f5:d8:a9:2a:4f:dd:8e:33:14:4b:52:47:ba:94:db:90:e3:80:d6:82:19:bf:db:73:d9:79:d2:82:74:86:ee:c1:d4:8b:56:62:37:9b:4f:e7:03:10:78:14:05:c7:71:1e:08:e9:5b:43:73:27:9d:ea:b8:c9:6a:4d:9e:be:74:bd:4e:4d:0a:b7:03:f1:1f:04:62:a3:2c:f1:5d:0e:27:c0:5d:25:d0:01:ce:f2:f6:2c:92:47:e6:fb:ab:6d:5e:bd:ad:5b:a1:f5:da:a3:60:70:0d:5a:98:a4:09:4f:94:61:59:68:aa:d5:01:b5:00:23:ff:22:bc:1b:d0:5f:36:ea:db:4c:91:80:f6:2b:43:8d:4b:1b:ae:c7:dd:14:a3:5f:f5:4d:8f:b0:0e:88:1c:d2:ba:2e:e9:ef:82:64:cb:b9:d9:fb:1c:7c:2b:77:ee:18:1a:26:5b:0c:28:db:77:8a:84:97:bb:3d:ef:51:bf:00:49:57:63:bb:58:aa:38:46:ea:f2:ef:00:c7:91:50:ff:7f:36:b0:58:55:c9:b4:a8:2f:2e:33:8b:bc:d7:dc:d5:6a:69:59:e2:ee:ec:85:42:20:8c:76:2c:3f:a2:dc:07:db:13:95:48:12:a7:ea:7f:de:fa:14:bd:34:5b:13:ab:51:cb:97:62:77:c8:73:69:f1:8e:ec:f5:0f:16:ce:88:da:b1:20:07:3a:8b:8f:5b:30:21:ef:60:4b:d4:66:d7:f1:a4:21:8c:93:de:87:90:78:90:34:9c:0c:02:7a:14:8f:47:81:ee:78:03:be:05:00:b4:bc:6f:e1:17:6e:56:c0:85:95:b4:1d:8a:05:48:cb:0d:20:dc:80:08:2c:19:96:44:01:2f:26:eb:d4:c5:6d:59:06:eb:14:fb:71:f0:66:f3:3e:4f:a2:c8:48:14:14:fb:77:27:bd:f4:73:31:11:69:39:a7:c2:38:64:b5:ca:82:ba:95:3a:fe:71:f1:a1:03:64:b8:46:c5:e1:89:de:be:44:da:7d:e1:aa:c7:c0:1d:1e:28:48:0f:12:2e:f8:67:48:6a:f1:a5:1a:20:9b:42:47:ed:7c:e9:6e:84:85:81:70:58:fd:5f:64:7a:b6:99:95:1f:60:9d:72:5a:b0:e0:da:6a:3b:ce:12:58:b9:ba:62:0b:e4:14:f2:f5:61:ff:3d:f5:c0:41:b2:53:93:c9:96:a9:23:3b:fc:3f:a6:39:40:6e:db:e7:28:74:8e:25:f9:bc:4a:14:b7:f5:36:1b:fd:e4:ef:3a:49:0b:4e:86:22:30:e8:49:d1:98:a6:d8:d7:f1:91:21:f0:b5:10:23:f5:e7:4a:d5:1f:e8:9f:f9:37:52:51:75:c6:73:fb:8f:44:1f:a2:82:66:17:3f:f4:0c:fb:ee:eb:f9:06:7d:59:0b:82:35:ac:f2:55:0d:49:ab:c7:0e:02:ee:43:f6:b4:7c:01:f4:11:66:75:b4:75:a3:bd:2e:0b:de:88:80:37:8d:bb:6a:95:2e:1e:b1:2d:e6:ac:00:a7:9c:ff:53:cf:62:53:94:6c:24:3b:2c:af:3e:e9:5d:59:9a:47:71:10:b2:83:1e:97:c1:82:62:9f:22:8a:d9:b5:37:62:10:fa:80:ab:af:4f:39:d1:9f:0e:c3:50:b6:99:f6:4d:28:33:fb:08:c9:d0:cd:ce:1d:ea:3a:18:05:a1:6c:0e:18:c9:fd:f0:3e:6e:8d:53:ee:a5:82:bf:30:ca:98:ec:f8:3a:22:52:f3:39:59:df:4d:1d:3d:08:0f:a6:f1:d3:f5:b2:1b:e1:68:23:bd:01:c3:b1:64:da:af:53:f8:2b:6d:f9:96:83:b2:49:89:5d:d4:ea:e5:c4:72:fc:b3:10:dd:b4:30:55:06:3c:0c:59:96:86:1b:c4:75:04:f6:28:6a:15:a4:02:c7:17:9d:10:0e:1c:f0:ad:67:ee:af:fb:06:41:7b:0b:f9:62:9e:c8:86:df:93:a6:54:8c:49:92:e0:eb:81:d0:f7:7c:ae:c5:2a:7d:e1:c9:f9:43:35:7d:b5:8a:0e:1f:fb:e3:5a:9a:71:0e:52:94:da:72:e4:bc:3f:be:e5:91:61:ce:f4:01:96:9a:8e:25:f3:68:56:28:1d:13:40:ba:28:f4:cd:44:f9:28:16:a4:90:b1:22:19:e4:6b:e6:9b:24:7b:7d:e5:d7:a9:e6:c6:27:33:7c:8e:a0:a8:27:a5:06:d7:00:8a:3a:0b:28:04:f0:61:39:77:84:3e:cb:21:fc:ae:3d:9f:eb:ad:ee:f4:8d:28:a2:0c:55:94:05:57:ba:79:bd:1f:77:f6:7e:5c:46:31:c2:8a:25:52:81:82:1f:65:66:61:dc:32:d9:bc:5d:8a:a3:ae:f9:63:8e:91:17:5a:c6:8d:fc:56:50:ab:84:8d:32:28:93:38:0e:2f:5e:ef:ec:d1:c8:31:3a:78:c9:c5:56:c7:f3:65:be:25:d4:bf:b1:ad:0f:d3:fd:a8:1a:21:f3:a8:6c:fe:9b:77:4a:7c:a9:34:ca:9b:63:06:68:59:b6:81:9c:f3:5d:9f:90:c1:4d:a3:ab:61:51:c1:5c:80:25:0b:5d:68:c1:85:de:fe:2a:73:9c:00:fe:5b:4c:5c:c5:04:b0:33:9a:1f:eb:66:73:fe:5d:ed:fb:d5:13:ee:71:b4:1d:ec:e7:8d:c9:4c:aa:0a:5e:4f:25:cf:0d:ec:fd:85:0e:c7:7b:ce:10:98:26:5a:0a:90:bb:e2:ca:22:69:f8:ee:e7:cb:18:10:23:54:38:bb:54:d8:c6:bf:30:be:10:4b:2e:9f:ae:e4:97:71:68:39:0c:e5:10:b7:2a:06:34:c6:4d:c6:51:e9:fb:e1:ad:0c:dc:5b:a4:5e:9e:52:02:d5:f1:d9:a5:31:d3:b7:7f:4a:2a:f4:1a:b2:5b:de:43:5c:9d:81:f2:39:fc:95:92:3a:d9:7a:c7:2c:3c:77:3a:28:fc:b3:87:ce:59:51:7a:6e:a2:fb:80:e8:16:f5:d3:41:76:30:be:fb:ab:16:9d:e2:d7:8c:16:c9:37" value="497afa0c28063859143976f2c610146c21ad0c87b08b8385d69b1ad1dd4e6f71163aafdb3e59f8419f73ffd3013cbe25cc57b48db2502253adb6afbb6af97fef683519ebce14843948f5d8a92a4fdd8e33144b5247ba94db90e380d68219bfdb73d979d2827486eec1d48b5662379b4fe70310781405c7711e08e95b4373279deab8c96a4d9ebe74bd4e4d0ab703f11f0462a32cf15d0e27c05d25d001cef2f62c9247e6fbab6d5ebdad5ba1f5daa360700d5a98a4094f94615968aad501b50023ff22bc1bd05f36eadb4c9180f62b438d4b1baec7dd14a35ff54d8fb00e881cd2ba2ee9ef8264cbb9d9fb1c7c2b77ee181a265b0c28db778a8497bb3def51bf00495763bb58aa3846eaf2ef00c79150ff7f36b05855c9b4a82f2e338bbcd7dcd56a6959e2eeec8542208c762c3fa2dc07db13954812a7ea7fdefa14bd345b13ab51cb976277c87369f18eecf50f16ce88dab120073a8b8f5b3021ef604bd466d7f1a4218c93de87907890349c0c027a148f4781ee7803be0500b4bc6fe1176e56c08595b41d8a0548cb0d20dc80082c199644012f26ebd4c56d5906eb14fb71f066f33e4fa2c8481414fb7727bdf47331116939a7c23864b5ca82ba953afe71f1a10364b846c5e189debe44da7de1aac7c01d1e28480f122ef867486af1a51a209b4247ed7ce96e8485817058fd5f647ab699951f609d725ab0e0da6a3bce1258b9ba620be414f2f561ff3df5c041b25393c996a9233bfc3fa639406edbe728748e25f9bc4a14b7f5361bfde4ef3a490b4e862230e849d198a6d8d7f19121f0b51023f5e74ad51fe89ff937525175c673fb8f441fa28266173ff40cfbeeebf9067d590b8235acf2550d49abc70e02ee43f6b47c01f4116675b475a3bd2e0bde8880378dbb6a952e1eb12de6ac00a79cff53cf6253946c243b2caf3ee95d599a477110b2831e97c182629f228ad9b5376210fa80abaf4f39d19f0ec350b699f64d2833fb08c9d0cdce1dea3a1805a16c0e18c9fdf03e6e8d53eea582bf30ca98ecf83a2252f33959df4d1d3d080fa6f1d3f5b21be16823bd01c3b164daaf53f82b6df99683b249895dd4eae5c472fcb310ddb43055063c0c5996861bc47504f6286a15a402c7179d100e1cf0ad67eeaffb06417b0bf9629ec886df93a6548c4992e0eb81d0f77caec52a7de1c9f943357db58a0e1ffbe35a9a710e5294da72e4bc3fbee59161cef401969a8e25f36856281d1340ba28f4cd44f92816a490b12219e46be69b247b7de5d7a9e6c627337c8ea0a827a506d7008a3a0b2804f0613977843ecb21fcae3d9febadeef48d28a20c55940557ba79bd1f77f67e5c4631c28a255281821f656661dc32d9bc5d8aa3aef9638e91175ac68dfc5650ab848d322893380e2f5eefecd1c8313a78c9c556c7f365be25d4bfb1ad0fd3fda81a21f3a86cfe9b774a7ca934ca9b63066859b6819cf35d9f90c14da3ab6151c15c80250b5d68c185defe2a739c00fe5b4c5cc504b0339a1feb6673fe5dedfbd513ee71b41dece78dc94caa0a5e4f25cf0decfd850ec77bce1098265a0a90bbe2ca2269f8eee7cb1810235438bb54d8c6bf30be104b2e9faee4977168390ce510b72a0634c64dc651e9fbe1ad0cdc5ba45e9e5202d5f1d9a531d3b77f4a2af41ab25bde435c9d81f239fc95923ad97ac72c3c773a28fcb387ce59517a6ea2fb80e816f5d3417630befbab169de2d78c16c937"/>
+    <field name="quic.frame" showname="ACK" size="5" pos="42" show="" value="">
+      <field name="quic.frame_type" showname="Frame Type: ACK (0x0000000000000002)" size="1" pos="0" show="2" value="02"/>
+      <field name="quic.ack.largest_acknowledged" showname="Largest Acknowledged: 1" size="1" pos="1" show="1" value="01"/>
+      <field name="quic.ack.ack_delay" showname="ACK Delay: 0" size="1" pos="2" show="0" value="00"/>
+      <field name="quic.ack.ack_range_count" showname="ACK Range Count: 0" size="1" pos="3" show="0" value="00"/>
+      <field name="quic.ack.first_ack_range" showname="First ACK Range: 0" size="1" pos="4" show="0" value="00"/>
+    </field>
+    <field name="quic.frame" showname="CRYPTO" size="94" pos="47" show="" value="">
+      <field name="quic.frame_type" showname="Frame Type: CRYPTO (0x0000000000000006)" size="1" pos="5" show="6" value="06"/>
+      <field name="quic.crypto.offset" showname="Offset: 0" size="1" pos="6" show="0" value="00"/>
+      <field name="quic.crypto.length" showname="Length: 90" size="2" pos="7" show="90" value="405a"/>
+      <field name="quic.crypto.crypto_data" showname="Crypto Data" size="90" pos="9" show="" value=""/>
+      <proto name="tls" showname="TLSv1.3 Record Layer: Handshake Protocol: Server Hello" size="90" pos="9">
+        <field name="tls.handshake" showname="Handshake Protocol: Server Hello" size="90" pos="9" show="" value="">
+          <field name="tls.handshake.type" showname="Handshake Type: Server Hello (2)" size="1" pos="9" show="2" value="02"/>
+          <field name="tls.handshake.length" showname="Length: 86" size="3" pos="10" show="86" value="000056"/>
+          <field name="tls.handshake.version" showname="Version: TLS 1.2 (0x0303)" size="2" pos="13" show="0x0303" value="0303"/>
+          <field name="tls.handshake.random" showname="Random: cd983e1b102040fe30155f1f92b115746ebbeb4acc2fcf11f425234e4afddc78" size="32" pos="15" show="cd:98:3e:1b:10:20:40:fe:30:15:5f:1f:92:b1:15:74:6e:bb:eb:4a:cc:2f:cf:11:f4:25:23:4e:4a:fd:dc:78" value="cd983e1b102040fe30155f1f92b115746ebbeb4acc2fcf11f425234e4afddc78"/>
+          <field name="tls.handshake.session_id_length" showname="Session ID Length: 0" size="1" pos="47" show="0" value="00"/>
+          <field name="tls.handshake.ciphersuite" showname="Cipher Suite: TLS_AES_128_GCM_SHA256 (0x1301)" size="2" pos="48" show="0x1301" value="1301"/>
+          <field name="tls.handshake.comp_method" showname="Compression Method: null (0)" size="1" pos="50" show="0" value="00"/>
+          <field name="tls.handshake.extensions_length" showname="Extensions Length: 46" size="2" pos="51" show="46" value="002e"/>
+          <field name="" show="Extension: key_share (len=36) x25519" size="40" pos="53" value="00330024001d0020ce433603786eab582ce1231af106ff7889690c33c704ef0402252d3fc175a071">
+            <field name="tls.handshake.extension.type" showname="Type: key_share (51)" size="2" pos="53" show="51" value="0033"/>
+            <field name="tls.handshake.extension.len" showname="Length: 36" size="2" pos="55" show="36" value="0024"/>
+            <field name="" show="Key Share extension" size="36" pos="57" value="001d0020ce433603786eab582ce1231af106ff7889690c33c704ef0402252d3fc175a071">
+              <field name="" show="Key Share Entry: Group: x25519, Key Exchange length: 32" size="36" pos="57" value="001d0020ce433603786eab582ce1231af106ff7889690c33c704ef0402252d3fc175a071">
+                <field name="tls.handshake.extensions_key_share_group" showname="Group: x25519 (29)" size="2" pos="57" show="29" value="001d"/>
+                <field name="tls.handshake.extensions_key_share_key_exchange_length" showname="Key Exchange Length: 32" size="2" pos="59" show="32" value="0020"/>
+                <field name="tls.handshake.extensions_key_share_key_exchange" showname="Key Exchange: ce433603786eab582ce1231af106ff7889690c33c704ef0402252d3fc175a071" size="32" pos="61" show="ce:43:36:03:78:6e:ab:58:2c:e1:23:1a:f1:06:ff:78:89:69:0c:33:c7:04:ef:04:02:25:2d:3f:c1:75:a0:71" value="ce433603786eab582ce1231af106ff7889690c33c704ef0402252d3fc175a071"/>
+              </field>
+            </field>
+          </field>
+          <field name="" show="Extension: supported_versions (len=2) TLS 1.3" size="6" pos="93" value="002b00020304">
+            <field name="tls.handshake.extension.type" showname="Type: supported_versions (43)" size="2" pos="93" show="43" value="002b"/>
+            <field name="tls.handshake.extension.len" showname="Length: 2" size="2" pos="95" show="2" value="0002"/>
+            <field name="tls.handshake.extensions.supported_version" showname="Supported Version: TLS 1.3 (0x0304)" size="2" pos="97" show="0x0304" value="0304"/>
+          </field>
+          <field name="tls.handshake.ja3s_full" showname="JA3S Fullstring: 771,4865,51-43" size="0" pos="51" show="771,4865,51-43"/>
+          <field name="tls.handshake.ja3s" showname="JA3S: eb1d94daa7e0344597e756a1fb6e7054" size="0" pos="51" show="eb1d94daa7e0344597e756a1fb6e7054"/>
+        </field>
+      </proto>
+    </field>
+    <field name="quic.payload" showname="PADDING Length: 1116" size="1116" pos="99" show="" value="">
+      <field name="quic.frame_type" showname="Frame Type: PADDING (0x0000000000000000)" size="1" pos="99" show="0" value="00"/>
+      <field name="quic.padding_length" showname="Padding Length: 1116" size="0" pos="100" show="1116"/>
+    </field>
+  </proto>
+         </packet>
+        </pdml>"#;
+
+        let mut reader = quick_xml::Reader::from_reader(BufReader::new(xml.as_bytes()));
+        match parse_xml(&mut reader, &[]).unwrap() {
+            Some(p) => match p.layer_name("quic") {
+                Some(layer) => {
+                    let metadata_name = "quic.payload";
+                    layer
+                        .metadata(metadata_name)
+                        .unwrap_or_else(|| panic!("Missing {}", metadata_name));
+
+                    let metadata_name = "quic.padding_length";
+                    layer
+                        .metadata(metadata_name)
+                        .unwrap_or_else(|| panic!("Missing {}", metadata_name));
+                }
+                None => panic!("missing protocol"),
+            },
+            _ => panic!("invalid Output type"),
+        }
+    }
+
+    #[test]
     fn test_rtshark_input_pcap() {
         let pcap = include_bytes!("test.pcap");
 
@@ -2057,7 +2281,7 @@ mod tests {
         tmp_dir.close().expect("Error deleting fifo dir");
     }
 
-    // this test may fail if executed in parallel with other tests. Run it with --test-threads=1 option.
+    // this test may fail if executed in parallel with other tests. Run `cargo test --  --test-threads=1`.
     #[test]
     fn test_rtshark_input_pcap_whitelist_missing_attr() {
         let pcap = include_bytes!("test.pcap");
@@ -2186,16 +2410,22 @@ mod tests {
             .input_path(fifo_path.to_str().unwrap())
             .live_capture();
 
+        let mut sys = sysinfo::System::new_all();
+
         let pid = {
             let rtshark = builder.spawn().unwrap();
             let pid = rtshark.pid().unwrap();
 
-            assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+            // assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+            sys.refresh_all();
+            assert!(sys.process(sysinfo::Pid::from_u32(pid)).is_some());
             pid
         };
 
         // verify tshark is stopped
-        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        sys.refresh_all();
+        // assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        assert!(sys.process(sysinfo::Pid::from_u32(pid)).is_none());
 
         /* remove fifo & tempdir */
         tmp_dir.close().expect("Error deleting fifo dir");
@@ -2224,7 +2454,7 @@ mod tests {
             nix::unistd::Pid::from_raw(rtshark.pid().unwrap() as libc::pid_t),
             nix::sys::signal::Signal::SIGKILL,
         )
-            .unwrap();
+        .unwrap();
 
         // reading from process output should give EOF
         match rtshark.read().unwrap() {
